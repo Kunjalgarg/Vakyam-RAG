@@ -141,6 +141,8 @@ Your Question (type exit to quit): exit
 
 See you soon 😉
 
+```
+
 # 📚 Technologies Used
 
 * **Llama.cpp**
@@ -155,8 +157,9 @@ See you soon 😉
 # 🚀 Future Improvements
 
 * Voice input
+* Multi-lingual support
 * Streaming responses
-* Web UI
+* Web/App UI
 * Multi-PDF support
 * Semantic caching
 
