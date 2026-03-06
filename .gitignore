@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+
+# Models
+*.gguf
+
+# System files
+.DS_Store
+Thumbs.db

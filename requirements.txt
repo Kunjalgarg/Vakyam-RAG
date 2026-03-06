@@ -1,0 +1,9 @@
+llama-cpp-python
+sentence-transformers
+faiss-cpu
+numpy
+pytesseract
+pdf2image
+gTTS
+pygame
+psutil
