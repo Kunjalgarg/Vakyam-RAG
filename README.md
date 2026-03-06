@@ -52,8 +52,8 @@ Text + Audio Output
 Clone the repo
 
 ```
-git clone https://github.com/YOUR_USERNAME/pdf-rag-assistant.git
-cd pdf-rag-assistant
+git clone https://github.com/Kunjalgarg/Vakyam-RAG.git
+cd Vakyam-RAG
 ```
 
 Create virtual environment
