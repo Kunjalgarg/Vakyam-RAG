@@ -4,6 +4,9 @@ import numpy as np
 import difflib
 import uuid
 import psutil
+import torch
+import time
+
 from llama_cpp import Llama
 from sentence_transformers import SentenceTransformer
 from pdf2image import convert_from_path
@@ -12,63 +15,66 @@ from gtts import gTTS
 import pygame
 
 
+# =============================
+# RAG SYSTEM
+# =============================
 class PDFRAG:
 
-    def __init__(self, model_path):
+    def __init__(self, model_path, n_gpu_layers=0, n_batch=512):
 
         print("Loading LLM...")
 
         physical = psutil.cpu_count(logical=False)
         threads = max(1, physical - 1)
 
-        print(f"System Detected: {physical} Physical Cores")
-        print(f"Setting n_threads to: {threads}")
-
         self.llm = Llama(
             model_path=model_path,
             n_ctx=4096,
             n_threads=threads,
-            n_batch=512,
+            n_batch=n_batch,
+            n_gpu_layers=n_gpu_layers,
             verbose=False
         )
 
         print("Loading embedding model...")
 
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
         self.embedding_model = SentenceTransformer(
             "intfloat/multilingual-e5-base",
-            device="cpu"
+            device=device
         )
+
+        print(f"Embeddings on: {device}")
 
         self.chunks = []
         self.index = None
 
+        pygame.mixer.init()
+
 
     # -----------------------------
-    # TEXT EXTRACTION
+    # OCR
     # -----------------------------
-
     def extract_text(self, pdf_path):
 
-        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-        poppler_path = r"C:\poppler\poppler-25.12.0\Library\bin"
+        pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+        os.environ["TESSDATA_PREFIX"] = r"C:\\Program Files\\Tesseract-OCR\\tessdata"
+        poppler_path = r"C:\\poppler\\poppler-25.12.0\\Library\\bin"
 
         pages = convert_from_path(pdf_path, dpi=200, poppler_path=poppler_path)
 
         text = ""
-
         for page in pages:
-            t = pytesseract.image_to_string(page, lang="hin")
-            text += t + "\n"
+            text += pytesseract.image_to_string(page, lang="hin") + "\n"
 
-        self.full_text = text
-        return text
+        self.full_text = self.clean_text(text)
 
 
     # -----------------------------
-    # CHUNKING
+    # CHUNKING (BETTER)
     # -----------------------------
-
-    def chunk_text(self, chunk_size=800, overlap=120):
+    def chunk_text(self, chunk_size=300, overlap=80):
 
         text = self.full_text
 
@@ -77,97 +83,126 @@ class PDFRAG:
             for i in range(0, len(text), chunk_size - overlap)
         ]
 
-        return self.chunks
+        print(f"✅ Total chunks: {len(self.chunks)}")
 
 
     # -----------------------------
-    # FAISS INDEX
+    # CREATE INDEX
     # -----------------------------
+    def create_index(self):
 
-    def create_faiss_index(self):
+        print("Creating embeddings...")
 
         passages = ["passage: " + c for c in self.chunks]
 
-        emb = self.embedding_model.encode(passages, convert_to_numpy=True)
+        emb = self.embedding_model.encode(
+            passages,
+            batch_size=32,
+            convert_to_numpy=True,
+            show_progress_bar=True,
+            normalize_embeddings=True
+        )
 
         dim = emb.shape[1]
 
         self.index = faiss.IndexFlatIP(dim)
-
-        faiss.normalize_L2(emb)
-
         self.index.add(emb)
 
+        print("✅ FAISS index created")
+
+
+    def clean_text(self, text):
+        text = text.replace("\n", " ")
+        text = " ".join(text.split())
+
+        # fix spaced Hindi letters (basic)
+        text = text.replace("म ा ध व", "माधव")
+        text = text.replace("घ ी स ू", "घीसू")
+
+        return text
 
     # -----------------------------
-    # QUERY UNDERSTANDING
+    # SAVE
     # -----------------------------
+    def save(self, path="rag_data"):
 
+        os.makedirs(path, exist_ok=True)
+
+        faiss.write_index(self.index, os.path.join(path, "index.faiss"))
+        np.save(os.path.join(path, "chunks.npy"), self.chunks)
+
+        print("✅ Index saved!")
+
+
+    # -----------------------------
+    # LOAD
+    # -----------------------------
+    def load(self, path="rag_data"):
+
+        index_path = os.path.join(path, "index.faiss")
+        chunk_path = os.path.join(path, "chunks.npy")
+
+        if not os.path.exists(index_path) or not os.path.exists(chunk_path):
+            raise FileNotFoundError("❌ Saved index not found. Run build first.")
+
+        self.index = faiss.read_index(index_path)
+        self.chunks = np.load(chunk_path, allow_pickle=True)
+
+        print("✅ Index loaded!")
+
+
+    # -----------------------------
+    # QUERY FIX
+    # -----------------------------
     def normalize_query(self, query):
 
-        query = query.lower()
+        words = query.lower().split()
 
-        words = query.split()
-
-        dictionary = [
-            "kafan",
-            "ghisu",
-            "madhav",
-            "budiya",
-            "summary",
-            "story",
-            "death",
-            "poverty"
-        ]
+        dictionary = ["kafan", "ghisu", "madhav", "budiya"]
 
         fixed = []
-
         for w in words:
-
             match = difflib.get_close_matches(w, dictionary, n=1)
-
-            if match:
-                fixed.append(match[0])
-            else:
-                fixed.append(w)
+            fixed.append(match[0] if match else w)
 
         return " ".join(fixed)
 
 
     # -----------------------------
-    # RETRIEVAL
+    # RETRIEVE (IMPROVED)
     # -----------------------------
-
-    def retrieve(self, query, k=3):
+    def retrieve(self, query, k=6):
 
         query = self.normalize_query(query)
 
         q = self.embedding_model.encode(
             ["query: " + query],
-            convert_to_numpy=True
+            convert_to_numpy=True,
+            normalize_embeddings=True
         )
-
-        faiss.normalize_L2(q)
 
         scores, idx = self.index.search(q, k)
 
         context = []
-
         sources = []
 
-        for i in idx[0]:
+        for i, score in zip(idx[0], scores[0]):
+            if score > 0.15:  # 🔥 filter weak matches
+                context.append(self.chunks[i])
+                sources.append(f"Chunk {i}")
 
-            context.append(self.chunks[i])
-
-            sources.append(f"Chunk {i}")
+        # fallback if nothing passes filter
+        if not context:
+            for i in idx[0]:
+                context.append(self.chunks[i])
+                sources.append(f"Chunk {i}")
 
         return "\n".join(context), sources
 
 
     # -----------------------------
-    # GENERATION
+    # GENERATE
     # -----------------------------
-
     def generate(self, system, user):
 
         prompt = f"""<|start_header_id|>system<|end_header_id|>
@@ -179,157 +214,125 @@ class PDFRAG:
 <|start_header_id|>assistant<|end_header_id|>
 """
 
-        output = self.llm(
+        out = self.llm(
             prompt,
-            max_tokens=600,
+            max_tokens=500,
             temperature=0.1,
             repeat_penalty=1.2,
             stop=["<|eot_id|>"]
         )
 
-        return output["choices"][0]["text"].strip()
+        return out["choices"][0]["text"].strip()
+
+
+    # -----------------------------
+    # ANSWER (BETTER PROMPTS)
+    # -----------------------------
+    def answer(self, q, lang="hindi"):
+
+        context, src = self.retrieve(q)
+
+        if lang == "english":
+            system = """You are a helpful assistant.
+
+    Answer the question ONLY using the provided context.
+    If the answer is not in the context, say:
+    "The answer is not present in the document."
+"""
+            user = f"Context:\n{context}\n\nQuestion:\n{q}"
+
+        else:
+            system = """आप एक हिन्दी सहायक हैं।
+
+नियम:
+- उत्तर केवल हिन्दी में ही दें (English बिल्कुल न लिखें)
+- केवल दिए गए संदर्भ से उत्तर दें
+- अगर उत्तर स्पष्ट न हो तो लिखें: "उत्तर संदर्भ में उपलब्ध नहीं है"
+- कोई अनुमान न लगाएँ
+"""
+            user = f"""संदर्भ:
+{context}
+
+प्रश्न:
+{q}
+
+⚠️ उत्तर केवल हिन्दी में दें।
+"""
+
+        return self.generate(system, user), src
 
 
     # -----------------------------
     # SUMMARY
     # -----------------------------
+    def summary(self, lang="hindi"):
 
-    def summarize_document(self, language="hindi"):
+        context = " ".join(self.chunks[:5])[:2000]
 
-        context = " ".join(self.chunks[:4])
-        context = context[:2000]   # prevent context overflow
-
-        if language == "english":
-
-            system = """
-    You are a literature expert.
-
-    Write a clear and detailed summary of the story using ONLY the provided context.
-    Do not introduce yourself.
-    Do not explain instructions.
-    Do not add outside knowledge.
-    Write in English.
-    """
-
-            user = f"""
-    Context:
-    {context}
-
-    Write a detailed summary of the story.
-    """
-
+        if lang == "english":
+            return self.generate(
+                "Summarize clearly from context only",
+                f"Context:\n{context}"
+            )
         else:
+            return self.generate(
+                "केवल संदर्भ से स्पष्ट हिन्दी सारांश लिखिए",
+                f"संदर्भ:\n{context}"
+            )
 
-            system = """
-    आप एक साहित्य विशेषज्ञ हैं।
-
-    नीचे दिए गए पाठ के आधार पर कहानी का स्पष्ट और विस्तृत सारांश लिखिए।
-    • केवल हिन्दी में लिखें
-    • अपना परिचय न दें
-    • निर्देशों की व्याख्या न करें
-    • बाहरी जानकारी न जोड़ें
-    """
-
-            user = f"""
-    संदर्भ:
-    {context}
-
-    कहानी का विस्तृत हिन्दी सारांश लिखिए।
-    """
-
-        return self.generate(system, user)
-
-
-    # -----------------------------
-    # QUESTION ANSWER
-    # -----------------------------
-    def answer_question(self, question, language="hindi"):
-
-        context, sources = self.retrieve(question)
-
-        if language == "english":
-
-            system = """
-    You are a helpful assistant.
-
-    Answer the question ONLY using the provided context.
-    If the answer is not in the context, say:
-    "The answer is not present in the document."
-    """
-
-            user = f"""
-    Context:
-    {context}
-
-    Question:
-    {question}
-
-    Answer clearly in English.
-    """
-
-        else:
-
-            system = """
-    आप एक सहायक AI हैं।
-
-    केवल दिए गए संदर्भ के आधार पर उत्तर दें।
-    यदि उत्तर संदर्भ में नहीं है तो लिखें:
-    "उत्तर दस्तावेज़ में उपलब्ध नहीं है।"
-    """
-
-            user = f"""
-    संदर्भ:
-    {context}
-
-    प्रश्न:
-    {question}
-
-    स्पष्ट हिन्दी में उत्तर दें।
-    """
-
-        answer = self.generate(system, user)
-
-        return answer, sources
 
     # -----------------------------
     # AUDIO
     # -----------------------------
+    def speak(self, text, lang="hi"):
 
-    def speak(self, text, lang="en"):
-
-        if not text or not text.strip():
-            print("No text for audio.")
+        if not text.strip():
             return
 
-        AUDIO_DIR = "audio_outputs"
-        os.makedirs(AUDIO_DIR, exist_ok=True)
+        file = f"audio_{uuid.uuid4().hex}.mp3"
 
-        filename = os.path.join(AUDIO_DIR, f"audio_{uuid.uuid4().hex}.mp3")
+        gTTS(text=text.replace("\n", " "), lang=lang).save(file)
 
-        tts = gTTS(text=text.replace("\n"," "), lang=lang)
-        tts.save(filename)
-
-        pygame.mixer.init()
-        pygame.mixer.music.load(filename)
+        pygame.mixer.music.load(file)
         pygame.mixer.music.play()
 
         while pygame.mixer.music.get_busy():
-            continue
+            time.sleep(0.1)
 
-        pygame.mixer.quit()
 
-        print(f"\nAudio saved → {filename}")
+# =============================
+# MAIN
+# =============================
+if __name__ == "__main__":
 
-    # -----------------------------
-    # PRETTY PRINT
-    # -----------------------------
+    MODEL = "meta-llama-3-8b-instruct.Q4_K_M.gguf"
+    PDF = "data/kafan.pdf"
 
-    def pretty_print(self, title, text):
+    rag = PDFRAG(MODEL, n_gpu_layers=-1, n_batch=2048)
 
-        print("\n" + "=" * 60)
-        print(f"{title}")
-        print("=" * 60)
+    if not os.path.exists("rag_data/index.faiss"):
 
-        print(text)
+        print("🔧 First time setup...")
 
-        print("=" * 60)
+        rag.extract_text(PDF)
+        rag.chunk_text()
+        rag.create_index()
+        rag.save()
+
+    else:
+        print("⚡ Loading saved index...")
+        rag.load()
+
+    print("\n🚀 Ready!\n")
+
+    while True:
+
+        q = input("Ask (or exit): ")
+
+        if q.lower() in ["exit", "quit"]:
+            break
+
+        ans, src = rag.answer(q)
+
+        print("\nANSWER:\n", ans)
+        print("Sources:", src)
