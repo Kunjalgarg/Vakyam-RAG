@@ -1,13 +1,18 @@
 # Python
+venv/
 __pycache__/
 *.pyc
 
-# Virtual env
-venv/
-
 # Models
-*.gguf
+models/*.gguf
 
-# System files
+# Data
+data/processed/*
+data/raw/*.pdf
+
+# Outputs
+outputs/
+
+# OS
 .DS_Store
 Thumbs.db
